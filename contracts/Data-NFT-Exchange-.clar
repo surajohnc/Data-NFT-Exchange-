@@ -1,4 +1,4 @@
-(define-non-fungible-token data-nft uint)
+﻿(define-non-fungible-token data-nft uint)
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -267,4 +267,46 @@
         platform-fee-rate: (var-get platform-fee-rate),
         contract-owner: contract-owner
     })
+)
+
+
+(define-constant err-bulk-discount (err u107))
+
+(define-read-only (get-bulk-discount (quantity uint))
+    (if (>= quantity u5)
+        u1000
+        u0
+    )
+)
+
+(define-public (purchase-with-bulk-discount (token-id uint) (quantity uint))
+    (let (
+        (metadata (unwrap! (map-get? token-metadata token-id) err-token-not-found))
+        (unit-price (get price metadata))
+        (discount-rate (get-bulk-discount quantity))
+        (total-price (* unit-price quantity))
+        (discount-amount (/ (* total-price discount-rate) u10000))
+        (final-price (- total-price discount-amount))
+        (creator (get creator metadata))
+        (platform-fee (calculate-platform-fee final-price))
+        (creator-payment (- final-price platform-fee))
+        (expiry-block (+ stacks-block-height (get license-duration metadata)))
+    )
+        (asserts! (>= quantity u1) err-bulk-discount)
+        (try! (stx-transfer? final-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+        (map-set license-agreements 
+            {token-id: token-id, licensee: tx-sender}
+            {
+                expiry-block: expiry-block,
+                access-rights: quantity,
+                payment-amount: final-price,
+                granted-at: stacks-block-height
+            }
+        )
+        (map-set creator-earnings creator 
+            (+ (get-creator-earnings creator) creator-payment))
+        (ok final-price)
+    )
 )
