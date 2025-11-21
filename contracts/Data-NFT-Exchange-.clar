@@ -1,4 +1,4 @@
-(define-non-fungible-token data-nft uint)
+﻿(define-non-fungible-token data-nft uint)
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -9,6 +9,9 @@
 (define-constant err-unauthorized-access (err u105))
 (define-constant err-invalid-royalty (err u106))
 (define-constant err-bulk-discount (err u107))
+(define-constant err-invalid-tier (err u108))
+(define-constant err-tier-not-found (err u109))
+(define-constant err-downgrade-not-allowed (err u110))
 
 (define-data-var next-token-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -32,6 +35,20 @@
 
 (define-map creator-earnings principal uint)
 (define-map platform-earnings principal uint)
+
+(define-map subscription-tiers {token-id: uint, tier-level: uint} {
+    tier-name: (string-utf8 20),
+    price: uint,
+    duration: uint,
+    features: uint
+})
+
+(define-map active-subscriptions {token-id: uint, subscriber: principal} {
+    tier-level: uint,
+    expiry-block: uint,
+    auto-renew: bool,
+    started-at: uint
+})
 
 (define-read-only (get-next-token-id)
     (var-get next-token-id)
@@ -360,5 +377,129 @@
         (map-set creator-earnings creator 
             (+ (get-creator-earnings creator) creator-payment))
         (ok final-price)
+    )
+)
+
+(define-public (create-subscription-tier 
+    (token-id uint)
+    (tier-level uint)
+    (tier-name (string-utf8 20))
+    (price uint)
+    (duration uint)
+    (features uint)
+)
+    (begin
+        (asserts! (is-eq tx-sender (unwrap! (nft-get-owner? data-nft token-id) err-token-not-found)) err-not-token-owner)
+        (asserts! (and (>= tier-level u1) (<= tier-level u3)) err-invalid-tier)
+        (map-set subscription-tiers 
+            {token-id: token-id, tier-level: tier-level}
+            {
+                tier-name: tier-name,
+                price: price,
+                duration: duration,
+                features: features
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (subscribe-to-tier (token-id uint) (tier-level uint))
+    (let (
+        (tier-data (unwrap! (map-get? subscription-tiers {token-id: token-id, tier-level: tier-level}) err-tier-not-found))
+        (metadata (unwrap! (map-get? token-metadata token-id) err-token-not-found))
+        (tier-price (get price tier-data))
+        (tier-duration (get duration tier-data))
+        (creator (get creator metadata))
+        (platform-fee (calculate-platform-fee tier-price))
+        (creator-payment (- tier-price platform-fee))
+        (expiry-block (+ stacks-block-height tier-duration))
+    )
+        (try! (stx-transfer? tier-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+        (map-set active-subscriptions
+            {token-id: token-id, subscriber: tx-sender}
+            {
+                tier-level: tier-level,
+                expiry-block: expiry-block,
+                auto-renew: false,
+                started-at: stacks-block-height
+            }
+        )
+        (map-set creator-earnings creator 
+            (+ (get-creator-earnings creator) creator-payment))
+        (map-set platform-earnings contract-owner 
+            (+ (get-platform-earnings contract-owner) platform-fee))
+        (ok true)
+    )
+)
+
+(define-public (upgrade-subscription (token-id uint) (new-tier-level uint))
+    (let (
+        (current-sub (unwrap! (map-get? active-subscriptions {token-id: token-id, subscriber: tx-sender}) err-token-not-found))
+        (current-tier (get tier-level current-sub))
+        (new-tier-data (unwrap! (map-get? subscription-tiers {token-id: token-id, tier-level: new-tier-level}) err-tier-not-found))
+        (metadata (unwrap! (map-get? token-metadata token-id) err-token-not-found))
+        (remaining-blocks (- (get expiry-block current-sub) stacks-block-height))
+        (upgrade-price (get price new-tier-data))
+        (creator (get creator metadata))
+        (platform-fee (calculate-platform-fee upgrade-price))
+        (creator-payment (- upgrade-price platform-fee))
+        (new-expiry (+ stacks-block-height (get duration new-tier-data)))
+    )
+        (asserts! (> new-tier-level current-tier) err-downgrade-not-allowed)
+        (asserts! (> (get expiry-block current-sub) stacks-block-height) err-license-expired)
+        (try! (stx-transfer? upgrade-price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? creator-payment tx-sender creator)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+        (map-set active-subscriptions
+            {token-id: token-id, subscriber: tx-sender}
+            {
+                tier-level: new-tier-level,
+                expiry-block: new-expiry,
+                auto-renew: (get auto-renew current-sub),
+                started-at: stacks-block-height
+            }
+        )
+        (map-set creator-earnings creator 
+            (+ (get-creator-earnings creator) creator-payment))
+        (ok true)
+    )
+)
+
+(define-public (toggle-auto-renew (token-id uint))
+    (let (
+        (current-sub (unwrap! (map-get? active-subscriptions {token-id: token-id, subscriber: tx-sender}) err-token-not-found))
+    )
+        (map-set active-subscriptions
+            {token-id: token-id, subscriber: tx-sender}
+            (merge current-sub {auto-renew: (not (get auto-renew current-sub))})
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-subscription-tier (token-id uint) (tier-level uint))
+    (map-get? subscription-tiers {token-id: token-id, tier-level: tier-level})
+)
+
+(define-read-only (get-active-subscription (token-id uint) (subscriber principal))
+    (map-get? active-subscriptions {token-id: token-id, subscriber: subscriber})
+)
+
+(define-read-only (is-subscription-active (token-id uint) (subscriber principal))
+    (match (map-get? active-subscriptions {token-id: token-id, subscriber: subscriber})
+        sub-data (> (get expiry-block sub-data) stacks-block-height)
+        false
+    )
+)
+
+(define-read-only (get-subscriber-tier-level (token-id uint) (subscriber principal))
+    (match (map-get? active-subscriptions {token-id: token-id, subscriber: subscriber})
+        sub-data (if (> (get expiry-block sub-data) stacks-block-height)
+                    (some (get tier-level sub-data))
+                    none)
+        none
     )
 )
