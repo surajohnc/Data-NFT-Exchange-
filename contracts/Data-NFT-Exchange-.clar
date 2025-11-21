@@ -1,4 +1,4 @@
-﻿(define-non-fungible-token data-nft uint)
+(define-non-fungible-token data-nft uint)
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -8,6 +8,7 @@
 (define-constant err-license-expired (err u104))
 (define-constant err-unauthorized-access (err u105))
 (define-constant err-invalid-royalty (err u106))
+(define-constant err-bulk-discount (err u107))
 
 (define-data-var next-token-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -74,6 +75,67 @@
 
 (define-read-only (calculate-platform-fee (amount uint))
     (/ (* amount (var-get platform-fee-rate)) u10000)
+)
+
+(define-read-only (get-bulk-discount (quantity uint))
+    (if (>= quantity u5)
+        u1000
+        u0
+    )
+)
+
+(define-read-only (quote-license-price (token-id uint) (quantity uint))
+    (match (map-get? token-metadata token-id)
+        metadata
+            (let (
+                (unit-price (get price metadata))
+                (discount-rate (get-bulk-discount quantity))
+                (total-price (* unit-price quantity))
+                (discount-amount (/ (* total-price discount-rate) u10000))
+                (discounted-price (- total-price discount-amount))
+                (platform-fee (calculate-platform-fee discounted-price))
+                (royalty-amount (calculate-royalty token-id discounted-price))
+                (creator-payment (- discounted-price (+ platform-fee royalty-amount)))
+            )
+                (ok {
+                    unit-price: unit-price,
+                    quantity: quantity,
+                    discount-rate: discount-rate,
+                    discount-amount: discount-amount,
+                    subtotal: total-price,
+                    final-price: discounted-price,
+                    platform-fee: platform-fee,
+                    royalty-amount: royalty-amount,
+                    creator-payment: creator-payment
+                })
+            )
+        err-token-not-found
+    )
+)
+
+(define-read-only (quote-extension-price (token-id uint) (additional-blocks uint))
+    (match (map-get? token-metadata token-id)
+        metadata
+            (let (
+                (base-price (get price metadata))
+                (base-duration (get license-duration metadata))
+                (extension-price (/ (* base-price additional-blocks) base-duration))
+                (platform-fee (calculate-platform-fee extension-price))
+                (royalty-amount (calculate-royalty token-id extension-price))
+                (creator-payment (- extension-price (+ platform-fee royalty-amount)))
+            )
+                (ok {
+                    base-price: base-price,
+                    base-duration: base-duration,
+                    additional-blocks: additional-blocks,
+                    extension-price: extension-price,
+                    platform-fee: platform-fee,
+                    royalty-amount: royalty-amount,
+                    creator-payment: creator-payment
+                })
+            )
+        err-token-not-found
+    )
 )
 
 (define-public (mint-data-nft 
@@ -267,16 +329,6 @@
         platform-fee-rate: (var-get platform-fee-rate),
         contract-owner: contract-owner
     })
-)
-
-
-(define-constant err-bulk-discount (err u107))
-
-(define-read-only (get-bulk-discount (quantity uint))
-    (if (>= quantity u5)
-        u1000
-        u0
-    )
 )
 
 (define-public (purchase-with-bulk-discount (token-id uint) (quantity uint))
